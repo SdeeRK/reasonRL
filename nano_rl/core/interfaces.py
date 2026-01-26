@@ -1,8 +1,10 @@
 from typing import Protocol, runtime_checkable
 
+import torch
+
 from .config import GenerationConfig
 from .types import (
-    AdvantageBatch,
+    AdvantageSample,
     ModelCheckpoint,
     PromptBatch,
     RewardBatch,
@@ -77,6 +79,21 @@ class ModelWorkerProtocol(Protocol):
         """
         ...
 
+    def zero_grad(self) -> None:
+        """
+        Clear gradients. Called by Trainer before train_step.
+        """
+        ...
+
+    def optimizer_step(self) -> float:
+        """
+        Perform optimizer step and lr scheduler step.
+        Called by Trainer after train_step.
+        Returns:
+            Current learning rate after the step.
+        """
+        ...
+
     def get_weights(self) -> ModelCheckpoint:
         """
         Get the current model weights for synchronization.
@@ -118,11 +135,11 @@ class AdvantageComputerProtocol(Protocol):
     """
     Compute advantages from rewards.
 
-    Transforms RewardBatch → AdvantageBatch by normalizing rewards within groups (for GRPO).
+    Transforms RewardBatch → list[AdvantageSample] by normalizing rewards within groups (for GRPO).
     Does NOT handle padding/tensorization - that's DataProcessor's job.
     """
 
-    def compute(self, reward_batch: RewardBatch) -> AdvantageBatch: ...
+    def __call__(self, reward_batch: RewardBatch) -> list[AdvantageSample]: ...
 
 
 @runtime_checkable
@@ -141,8 +158,25 @@ class DataProcessorProtocol(Protocol):
 
     def to_training_batch(
         self,
-        advantage_batch: AdvantageBatch,
+        advantage_batch: list[AdvantageSample],
         max_length: int | None = None,
     ) -> TrainingBatch:
         """Pad and tensorize samples for training."""
         ...
+
+
+@runtime_checkable
+class LossComputerProtocol(Protocol):
+    """
+    Compute loss for training.
+    """
+
+    def __call__(
+        self,
+        model_inputs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        labels: torch.Tensor,
+        response_mask: torch.Tensor,
+        advantages: torch.Tensor,
+        return_token_entropy: bool,
+    ) -> StepMetrics: ...

@@ -1,16 +1,20 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
+import yaml
+
 
 @dataclass
 class ModelConfig:
     model_name_or_path: str = field(
-        metadata={"help": "The model checkpoint for weights initialization."}
+        default="Qwen/Qwen2.5-Math-1.5B",
+        metadata={"help": "The model checkpoint for weights initialization."},
     )
     gpu_memory_utilization: float = field(
+        default=0.8,
         metadata={
             "help": "The ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV cache."
-        }
+        },
     )
     dtype: Literal["bfloat16", "float16", "float32"] = field(
         default="bfloat16",
@@ -18,11 +22,11 @@ class ModelConfig:
     )
 
     # Ray GPU allocation
-    model_num_gpus: int = field(
+    model_num_gpus: float = field(
         default=1,
         metadata={"help": "Number of GPUs to allocate for ModelWorker (training)."},
     )
-    rollout_num_gpus: int = field(
+    rollout_num_gpus: float = field(
         default=1,
         metadata={
             "help": "Number of GPUs to allocate for RolloutWorker (vLLM inference)."
@@ -82,6 +86,58 @@ class GenerationConfig:
             "help": "Whether to return log probabilities of the generated tokens."
         },
     )
+    stop_tokens: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "List of strings that stop the generation when they are generated."
+        },
+    )
+
+
+@dataclass
+class AdvantageConfig:
+    """Configuration for advantage computation."""
+
+    mode: Literal["raw", "grpo", "grpo_no_std"] = field(
+        default="grpo",
+        metadata={
+            "help": (
+                "Advantage computation mode. "
+                "'raw': use reward directly as advantage (no normalization). "
+                "'grpo': subtract mean and divide by std within each group. "
+                "'grpo_no_std': only subtract mean within each group."
+            )
+        },
+    )
+    advantage_eps: float = field(
+        default=1e-6,
+        metadata={
+            "help": "Small epsilon for numerical stability when dividing by std."
+        },
+    )
+
+
+@dataclass
+class LossConfig:
+    loss_level: Literal["token", "sequence"] = field(
+        default="token",
+        metadata={
+            "help": (
+                "Granularity of loss aggregation. "
+                "'token': average loss over all response tokens across the batch. "
+                "'sequence': first average loss per sequence, then average across sequences in the batch."
+            )
+        },
+    )
+
+    clip_range_left: float = field(
+        default=0.2,
+        metadata={"help": "Lower bound for the clipping range."},
+    )
+    clip_range_right: float = field(
+        default=0.3,
+        metadata={"help": "Upper bound for the clipping range."},
+    )
 
 
 @dataclass
@@ -91,7 +147,16 @@ class TrainConfig:
         default=200, metadata={"help": "Number of GRPO steps to run."}
     )
 
-    max_seq_length: int = field(
+    train_dataset: str = field(
+        default="",
+        metadata={"help": "Path to the training dataset."},
+    )
+    eval_dataset: str = field(
+        default="",
+        metadata={"help": "Path to the evaluation dataset."},
+    )
+
+    truncate_max_length: int = field(
         default=2048,
         metadata={
             "help": "Maximum total sequence length (prompt + response) for training. Sequences exceeding this will be truncated from the end."
@@ -100,11 +165,6 @@ class TrainConfig:
 
     learning_rate: float = field(
         default=1e-5, metadata={"help": "Learning rate for the policy optimization."}
-    )
-
-    advantage_eps: float = field(
-        default=1e-6,
-        metadata={"help": "Small epsilon for advantage calculation stability."},
     )
 
     rollout_batch_size: int = field(
@@ -133,21 +193,6 @@ class TrainConfig:
         default=2, metadata={"help": "Size of micro-batch per device step."}
     )
 
-    # Algorithm specifics
-    loss_type: Literal[
-        "no_baseline",
-        "reinforce_with_baseline",
-        "grpo_clip",
-    ] = field(
-        default="reinforce_with_baseline",
-        metadata={"help": "Type of loss function to use."},
-    )
-
-    use_std_normalization: bool = field(
-        default=True,
-        metadata={"help": "Whether to normalize advantages using standard deviation."},
-    )
-
     # Optimizer (AdamW) specific
     weight_decay: float = field(
         default=0.0, metadata={"help": "Weight decay for AdamW optimizer."}
@@ -166,8 +211,13 @@ class TrainConfig:
         metadata={"help": "Whether to use gradient checkpointing to save memory."},
     )
 
-    grad_norm_clip: float = field(
-        default=1.0, metadata={"help": "Gradient norm clipping value."}
+    max_grad_norm: float = field(
+        default=1.0, metadata={"help": "Maximum gradient norm for clipping."}
+    )
+
+    return_token_entropy: bool = field(
+        default=False,
+        metadata={"help": "Whether to compute and return token-level entropy."},
     )
 
     # Learning rate scheduler parameters
@@ -213,10 +263,48 @@ class TrainConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Weights & Biases logging configuration."""
+
+    enabled: bool = field(
+        default=True, metadata={"help": "Whether to enable WandB logging."}
+    )
+
+    project: str = field(default="nano-rl", metadata={"help": "WandB project name."})
+    entity: str | None = field(
+        default=None,
+        metadata={"help": "WandB entity (username or team). If None, uses default."},
+    )
+    run_name: str | None = field(
+        default=None,
+        metadata={"help": "WandB run name. If None, auto-generated."},
+    )
+    tags: list[str] = field(
+        default_factory=list,
+        metadata={"help": "List of tags for the run."},
+    )
+    log_interval: int = field(
+        default=1,
+        metadata={"help": "Log metrics every N steps."},
+    )
+    eval_interval: int = field(
+        default=100,
+        metadata={"help": "Run evaluation every N steps."},
+    )
+    save_interval: int = field(
+        default=100,
+        metadata={"help": "Save checkpoint every N steps."},
+    )
+
+
+@dataclass
 class RLConfig:
-    model_config: ModelConfig = field(default_factory=ModelConfig)
+    model_config: ModelConfig
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
     train_config: TrainConfig = field(default_factory=TrainConfig)
+    loss_config: LossConfig = field(default_factory=LossConfig)
+    advantage_config: AdvantageConfig = field(default_factory=AdvantageConfig)
+    wandb_config: WandbConfig = field(default_factory=WandbConfig)
 
     def __post_init__(self):
         assert (
@@ -227,3 +315,18 @@ class RLConfig:
         assert (
             self.train_config.train_batch_size >= self.generation_config.group_size
         ), "train_batch_size must be greater than or equal to group_size"
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "RLConfig":
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RLConfig":
+        from dacite import Config as DaciteConfig
+        from dacite import from_dict as dacite_from_dict
+
+        return dacite_from_dict(
+            data_class=cls, data=data, config=DaciteConfig(strict=True)
+        )

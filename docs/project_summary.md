@@ -126,3 +126,7 @@ nano-RL/
 ├── tests/
 └── pyproject.toml
 ```
+
+# 个人思路
+dataset的输入是jsonl的data_path，输出是List[Sample]，每个sample包含prompt和ground_truth
+每个batch size，是从dataloader返回List[Sample],所以他的collate fn是无转化的返回

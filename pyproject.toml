@@ -14,6 +14,11 @@ dependencies = [
     "tqdm>=4.66.5",
     "wandb>=0.24.0",
     "peft>=0.18.1",
+    "math-verify>=0.9.0",
+    "dacite>=1.9.2",
+    "tyro>=1.0.5",
+    "loguru>=0.7.3",
+    "rich>=14.3.1",
 ]
 
 [tool.setuptools.packages.find]

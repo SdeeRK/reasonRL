@@ -7,6 +7,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from transformers import AutoModelForCausalLM
 
 from ..core.config import ModelConfig, TrainConfig
+from ..core.interfaces import LossComputerProtocol
 from ..core.types import ModelCheckpoint, StepMetrics, TrainingBatch
 
 
@@ -59,13 +60,20 @@ class ModelWorker:
     Runs as a Ray remote actor with GPU access.
     """
 
-    def __init__(self, model_config: ModelConfig, train_config: TrainConfig) -> None:
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        train_config: TrainConfig,
+        loss_fn: LossComputerProtocol,
+    ) -> None:
         self.model_config = model_config
         self.train_config = train_config
+        self.loss_fn = loss_fn
         self.device = torch.device("cuda")
 
         self.model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=model_config.model_name_or_path,
+            attn_implementation="flash_attention_2",
             torch_dtype=self.dtype,
         ).to(self.device)
 
@@ -84,7 +92,13 @@ class ModelWorker:
 
         if self.train_config.gradient_checkpoint:
             self.model.config.use_cache = False
-            self.model.gradient_checkpointing_enable()
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+        # Ensure we have gradients for LoRA
+        if self.model_config.use_lora:
+            self.model.enable_input_require_grads()
 
     def _apply_lora(self):
         """Apply LoRA adapter to the model."""
@@ -139,19 +153,118 @@ class ModelWorker:
         else:
             raise ValueError("noncorrect dtype")
 
-    def train_step(self, batch: TrainingBatch) -> StepMetrics:
-        pass
+    def zero_grad(self) -> None:
+        """Clear gradients. Called by Trainer before train_step."""
+        self.optimizer.zero_grad()
 
-    def _restore_lora_and_optimizer(self) -> None:
-        """Re-apply LoRA and restore optimizer after merge_and_unload."""
-        self.model = self._apply_lora()
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.train_config.learning_rate,
-            weight_decay=self.train_config.weight_decay,
-            betas=(self.train_config.adam_beta1, self.train_config.adam_beta2),
+    def optimizer_step(self) -> float:
+        """
+        Perform optimizer step and lr scheduler step.
+        Called by Trainer after train_step.
+        Returns:
+            Gradient norm (if calculated during clipping, else 0.0).
+        """
+        grad_norm = 0.0
+        # Gradient clipping (if configured)
+        if self.train_config.max_grad_norm:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.train_config.max_grad_norm,
+            ).item()
+
+        self.optimizer.step()
+        self.lr_scheduler.step()
+
+        return grad_norm
+
+    def get_learning_rate(self) -> float:
+        """Get current learning rate."""
+        return self.lr_scheduler.get_last_lr()[0]
+
+    def train_step(self, batch: TrainingBatch) -> StepMetrics:
+        """
+        Perform forward pass and backward pass with gradient accumulation.
+        Does NOT call optimizer.step() - that's controlled by Trainer.
+
+        Args:
+            batch: Training batch containing input_ids, response_mask, old_log_probs, advantages.
+
+        Returns:
+            StepMetrics with loss and optional entropy and learning rate.
+        """
+        self.model.train()
+
+        total_loss = 0.0
+        total_entropy = 0.0 if self.train_config.return_token_entropy else None
+        learning_rate = self.get_learning_rate()
+        accumulated_stats: dict[str, float] = {}
+
+        for gradient_step in range(self.train_config.gradient_accumulation_steps):
+            start_index = gradient_step * self.train_config.micro_train_batch_size
+            end_index = start_index + self.train_config.micro_train_batch_size
+            micro_batch = batch[start_index:end_index].to(self.device)
+
+            # Shift for causal LM: input is [:-1], label is [1:]
+            input_ids = micro_batch.input_ids[:, :-1]
+            attention_mask = micro_batch.attention_mask[:, :-1]
+            labels = micro_batch.input_ids[:, 1:]
+            response_mask = micro_batch.response_mask[:, 1:]
+
+            # Also shift old_log_probs to match labels
+            old_log_probs = (
+                micro_batch.old_log_probs[:, 1:]
+                if micro_batch.old_log_probs is not None
+                else None
+            )
+            advantages = (
+                micro_batch.advantages
+            )  # (batch_size,) - per sequence, no shift needed
+
+            model_output = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+
+            loss_metrics = self.loss_fn(
+                model_logits=model_output.logits,
+                old_log_probs=old_log_probs,
+                labels=labels,
+                response_mask=response_mask,
+                advantages=advantages,
+                return_token_entropy=self.train_config.return_token_entropy,
+            )
+
+            loss = loss_metrics.loss / self.train_config.gradient_accumulation_steps
+            loss.backward()
+
+            total_loss += loss.item()
+            if (
+                self.train_config.return_token_entropy
+                and loss_metrics.entropy is not None
+            ):
+                total_entropy += loss_metrics.entropy
+
+            # Accumulate stats
+            for key, value in loss_metrics.stats.items():
+                if key not in accumulated_stats:
+                    accumulated_stats[key] = 0.0
+                accumulated_stats[key] += value
+
+        # Average stats across gradient accumulation steps
+        num_steps = self.train_config.gradient_accumulation_steps
+        averaged_stats = {k: v / num_steps for k, v in accumulated_stats.items()}
+
+        # Compute average entropy if enabled
+        entropy = None
+        if self.train_config.return_token_entropy and total_entropy is not None:
+            entropy = total_entropy / num_steps
+
+        return StepMetrics(
+            loss=total_loss,
+            entropy=entropy,
+            stats=averaged_stats,
+            learning_rate=learning_rate,
         )
-        self.lr_scheduler = self._create_lr_scheduler()
 
     def get_weights(self, global_step: int) -> ModelCheckpoint:
         """
@@ -159,11 +272,20 @@ class ModelWorker:
         If LoRA is enabled, merges LoRA weights into the base model and returns full weights.
         """
         if self.model_config.use_lora:
-            merged_model = self.model.merge_and_unload()
-            state_dict = {k: v.cpu() for k, v in merged_model.state_dict().items()}
-            self._restore_lora_and_optimizer()
+            self.model.merge_adapter()
+            underlying_model = self.model.base_model.model
+
+            state_dict = {}
+            for k, v in underlying_model.state_dict().items():
+                if "lora_" in k or "adapter_" in k:
+                    continue
+
+                new_key = k.replace(".base_layer", "")
+                state_dict[new_key] = v.cpu()
+
+            self.model.unmerge_adapter()
         else:
-            state_dict = self.model.state_dict()
+            state_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
 
         return ModelCheckpoint(global_step=global_step, state_dict=state_dict)
 
@@ -173,8 +295,12 @@ class ModelWorker:
         If LoRA is enabled, merges weights and saves the full model.
         """
         if self.model_config.use_lora:
-            merged_model = self.model.merge_and_unload()
-            merged_model.save_pretrained(path)
-            self._restore_lora_and_optimizer()
+            self.model.merge_adapter()
+            # Save the underlying model (merged)
+            # Accessing valid underlying model depending on PEFT structure
+            # Usually self.model.base_model.model is the HF model
+            underlying_model = self.model.base_model.model
+            underlying_model.save_pretrained(path)
+            self.model.unmerge_adapter()
         else:
             self.model.save_pretrained(path)

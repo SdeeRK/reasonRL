@@ -42,6 +42,7 @@ tests/
 
 # Type checking
 .mypy_cache/
+.ruff_cache/
 
 # Ray
 .rayignore
@@ -59,3 +60,5 @@ wandb/
 
 # UV
 uv.lock
+
+eval_results/

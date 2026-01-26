@@ -81,10 +81,12 @@ class GroupRollout:
 
     Attributes:
         sample: The original sample containing the prompt.
+        prompt_ids: Token IDs of the prompt.
         items: List of SingleRollout results for this prompt.
     """
 
     sample: Sample
+    prompt_ids: list[int]
     items: list[SingleRollout]
 
 
@@ -147,31 +149,16 @@ class AdvantageSample:
 
 
 @dataclass
-class AdvantageBatch:
-    """
-    Batch of samples with computed advantages (before padding/tensorization).
-
-    This is the output of AdvantageComputer and input to DataProcessor.to_training_batch().
-    Samples are flattened from groups (no longer grouped by prompt).
-    """
-
-    samples: list[AdvantageSample]
-
-    def __len__(self):
-        return len(self.samples)
-
-
-@dataclass
 class TrainingBatch:
     """
     Batch of training data for policy optimization.
 
     Attributes:
-        input_ids: Token IDs tensor of shape (batch_size, seq_len).
-        response_mask: Binary mask indicating response tokens (1) vs prompt tokens (0).
-        attention_mask: Optional attention mask for transformer models.
-        old_log_probs: Log probabilities from the rollout policy (for off-policy training).
-        advantages: Computed advantage values for each response.
+        input_ids (batch_size, seq_len): Token IDs of the input sequence.
+        response_mask (batch_size, seq_len): Binary mask indicating response tokens (1) vs prompt tokens (0).
+        attention_mask (batch_size, seq_len): Optional attention mask for transformer models.
+        old_log_probs (batch_size, seq_len): Log probabilities from the rollout policy (for off-policy training).
+        advantages (batch_size,): Computed advantage values for each response.
     """
 
     input_ids: torch.Tensor
@@ -213,6 +200,22 @@ class TrainingBatch:
             else None,
         )
 
+    def minibatches(self, batch_size: int, shuffle: bool = True):
+        """
+        Yield minibatches from the full training batch.
+
+        Args:
+            batch_size: Size of each minibatch.
+            shuffle: Whether to shuffle the data before batching.
+        """
+        num_samples = len(self)
+        indices = torch.randperm(num_samples) if shuffle else torch.arange(num_samples)
+
+        for start_idx in range(0, num_samples, batch_size):
+            end_idx = min(start_idx + batch_size, num_samples)
+            batch_indices = indices[start_idx:end_idx]
+            yield self[batch_indices]
+
 
 @dataclass
 class StepMetrics:
@@ -221,14 +224,14 @@ class StepMetrics:
 
     Attributes:
         loss: The training loss value.
-        learning_rate: Current learning rate.
+        learning_rate: Current learning rate (filled by Trainer).
         gradient_norm: Optional gradient norm after clipping.
         entropy: Optional policy entropy for monitoring exploration.
         stats: Additional custom statistics as key-value pairs.
     """
 
     loss: float
-    learning_rate: float
+    learning_rate: float | None = None
     gradient_norm: float | None = None
     entropy: float | None = None
     stats: dict[str, float] = field(default_factory=dict)

@@ -15,7 +15,7 @@ class PromptDataset(Dataset):
 
     def __init__(self, data_path: str):
         self.samples: list[Sample] = []
-        with open(data_path) as f:
+        with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 item = json.loads(line)
                 self.samples.append(

@@ -1,0 +1,62 @@
+# Example RL Configuration File
+# All fields are optional - missing fields will use default values
+
+model_config:
+  model_name_or_path: "Qwen/Qwen2.5-Math-1.5B"
+  gpu_memory_utilization: 0.4
+  dtype: "bfloat16"
+  model_num_gpus: 0.5
+  rollout_num_gpus: 0.5
+  # LoRA settings
+  use_lora: true
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  lora_target_modules: ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj', 'lm_head', 'embed_tokens']
+
+generation_config:
+  group_size: 8
+  temperature: 1.0
+  top_p: 0.9
+  min_tokens: 4
+  max_tokens: 1024
+  include_logprobs: true
+  stop_tokens:
+    - "</answer>"
+
+train_config:
+  n_grpo_steps: 50
+  train_dataset: "data/gsm8k_train.jsonl"
+  eval_dataset: "data/gsm8k_test.jsonl"
+  truncate_max_length: 2048
+  learning_rate: 1.0e-4
+  rollout_batch_size: 256
+  epochs_per_rollout_batch: 3
+  train_batch_size: 64
+  micro_train_batch_size: 1
+  # Optimizer settings
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  gradient_checkpoint: false
+  max_grad_norm: 1.0
+  return_token_entropy: true
+  # LR scheduler
+  lr_scheduler_type: "cosine"  # options: constant, cosine
+  warmup_ratio: 0.1
+  min_lr_ratio: 0.1
+
+loss_config:
+  loss_level: "token"  # options: token, sequence
+  clip_range_left: 0.2
+  clip_range_right: 0.3
+
+wandb_config:
+  enabled: true
+  project: "nano-rl"
+  entity: null
+  run_name: null
+  tags: []
+  log_interval: 1
+  eval_interval: 2
+  save_interval: 10
