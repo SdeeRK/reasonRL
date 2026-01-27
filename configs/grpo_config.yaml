@@ -7,7 +7,8 @@ model_config:
   dtype: "bfloat16"
   model_num_gpus: 1
   rollout_num_gpus: 1
-  # LoRA settings
+
+  # LoRA settings, default none
   use_lora: false
   lora_rank: 8
   lora_alpha: 16
@@ -20,29 +21,33 @@ generation_config:
   top_p: 0.9
   min_tokens: 4
   max_tokens: 1024
-  include_logprobs: true
   stop_tokens:
     - "</answer>"
+  
+advantage_config:
+  mode: 'grpo_no_std'
+  advantage_eps: 1.0e-6
 
 train_config:
-  n_grpo_steps: 50
-  train_dataset: "data/gsm8k_train.jsonl"
-  eval_dataset: "data/gsm8k_test.jsonl"
+  n_grpo_steps: 200
+  train_dataset: "data/gsm8k/train.jsonl"
+  eval_dataset: "data/gsm8k/test.jsonl"
   truncate_max_length: 2048
-  learning_rate: 5.0e-5
-  rollout_batch_size: 256
-  epochs_per_rollout_batch: 2
-  train_batch_size: 128
-  micro_train_batch_size: 1
+  learning_rate: 3.0e-5
+  rollout_batch_size: 64
+  epochs_per_rollout_batch: 1
+  train_batch_size: 32
+  micro_train_batch_size: 2
+  
   # Optimizer settings
-
   adam_beta1: 0.9
   adam_beta2: 0.95
   gradient_checkpoint: true
   max_grad_norm: 1.0
   return_token_entropy: true
+
   # LR scheduler
-  lr_scheduler_type: "cosine"  # options: constant, cosine
+  lr_scheduler_type: "constant"  # options: constant, cosine
   warmup_ratio: 0.1
   min_lr_ratio: 0.1
 
@@ -53,10 +58,11 @@ loss_config:
 
 wandb_config:
   enabled: true
-  project: "nano-rl"
+  project: "reason-rl"
   entity: null
   run_name: null
-  tags: []
+  tags: ['token_level', 'grpo_no_std', 'gsm8k-math']
   log_interval: 1
-  eval_interval: 1
-  save_interval: 10
+  eval_interval: 10
+  save_interval: 100
+

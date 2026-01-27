@@ -58,7 +58,7 @@ Thumbs.db
 *.log
 wandb/
 
-# UV
-uv.lock
 
 eval_results/
+data/
+checkpoints/
