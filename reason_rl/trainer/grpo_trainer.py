@@ -13,6 +13,7 @@ from ..core.interfaces import (
 from ..core.processor import DataProcessor
 from ..core.types import PromptBatch, RewardBatch, RolloutBatch, Sample, StepMetrics
 from ..logger import get_logger
+from ..core.profiler import Profiler
 from .base_trainer import BaseTrainer
 
 try:
@@ -56,6 +57,7 @@ class GRPOTrainer(BaseTrainer):
         self.reward_fn = reward_fn
         self.advantage_fn = advantage_fn
         self.loss_fn = loss_fn
+        self.profiler = Profiler()
 
         self.model_worker = model_worker_cls.options(num_gpus=config.model_config.model_num_gpus).remote(
             config.model_config,
@@ -98,55 +100,63 @@ class GRPOTrainer(BaseTrainer):
             samples: list[Sample] = self._get_next_batch()
             logger.info(f"rl step {rl_step + 1}/{train_config.n_grpo_steps}")
 
-            prompt_batch: PromptBatch = self.data_processor.to_prompt_batch(samples)
+            with self.profiler.timer("data_process"):
+                prompt_batch: PromptBatch = self.data_processor.to_prompt_batch(samples)
 
-            logger.info(
-                f"rollout worker generate {len(samples)} prompts * {generation_config.group_size} group_size..."
-            )
-            rollout_batch: RolloutBatch = ray.get(self.rollout_worker.generate.remote(prompt_batch, generation_config))
+            logger.info(f"rollout worker generate {len(samples)} prompts * {generation_config.group_size} group_size...")
+            with self.profiler.timer("rollout_generate"):
+                rollout_batch: RolloutBatch = ray.get(self.rollout_worker.generate.remote(prompt_batch, generation_config))
 
             logger.info("computing old log probs...")
-            rollout_batch: RolloutBatch = ray.get(self.model_worker.compute_log_probs.remote(rollout_batch))
+            with self.profiler.timer("compute_ref_logprobs"):
+                rollout_batch: RolloutBatch = ray.get(self.model_worker.compute_log_probs.remote(rollout_batch))
 
-            reward_batch: RewardBatch = self.reward_fn(rollout_batch)
-            rollout_summary = rollout_batch.summary()
-            rollout_summary.update(reward_batch.summary())
+            with self.profiler.timer("reward_compute"):
+                reward_batch: RewardBatch = self.reward_fn(rollout_batch)
+                rollout_summary = rollout_batch.summary()
+                rollout_summary.update(reward_batch.summary())
+            
             logger.info(f"rollout summary : {rollout_summary}")
             self._log_metrics(rollout_summary, prefix="rollout")
 
-            advantage_samples = self.advantage_fn(reward_batch)
-            training_batch = self.data_processor.to_training_batch(advantage_samples)
+            with self.profiler.timer("advantage_compute"):
+                advantage_samples = self.advantage_fn(reward_batch)
+                training_batch = self.data_processor.to_training_batch(advantage_samples)
 
-            for epoch in range(train_config.epochs_per_rollout_batch):
-                for mini_batch_step, mini_batch in enumerate(training_batch.minibatches(train_config.train_batch_size)):
-                    self.global_step += 1
+            with self.profiler.timer("train_step"):
+                for epoch in range(train_config.epochs_per_rollout_batch):
+                    for mini_batch_step, mini_batch in enumerate(training_batch.minibatches(train_config.train_batch_size)):
+                        self.global_step += 1
 
-                    ray.get(self.model_worker.zero_grad.remote())
-                    metrics: StepMetrics = ray.get(self.model_worker.train_step.remote(mini_batch))
-                    grad_norm: float = ray.get(self.model_worker.optimizer_step.remote())
-                    metrics.gradient_norm = grad_norm
+                        ray.get(self.model_worker.zero_grad.remote())
+                        metrics: StepMetrics = ray.get(self.model_worker.train_step.remote(mini_batch))
+                        grad_norm: float = ray.get(self.model_worker.optimizer_step.remote())
+                        metrics.gradient_norm = grad_norm
 
-                    logger.info(
-                        f"global step {self.global_step} | rl step {rl_step + 1} | epoch {epoch + 1} | batch {mini_batch_step + 1} | "
-                        f"loss: {metrics.loss:.3e} | "
-                        f"lr: {metrics.learning_rate:.3e} | "
-                        f"grad: {grad_norm:.4f} | "
-                        f"ratio: {metrics.stats.get('mean_ratio', 0.0):.4f}"
-                    )
+                        logger.info(
+                            f"global step {self.global_step} | rl step {rl_step + 1} | epoch {epoch + 1} | batch {mini_batch_step + 1} | "
+                            f"loss: {metrics.loss:.3e} | "
+                            f"lr: {metrics.learning_rate:.3e} | "
+                            f"grad: {grad_norm:.4f} | "
+                            f"ratio: {metrics.stats.get('mean_ratio', 0.0):.4f}"
+                        )
 
-                    train_metrics = {
-                        "loss": metrics.loss,
-                        "learning_rate": metrics.learning_rate,
-                        "gradient_norm": grad_norm,
-                        **metrics.stats,
-                    }
-                    if metrics.entropy is not None:
-                        train_metrics["entropy"] = metrics.entropy
-                    self._log_metrics(train_metrics, prefix="train")
+                        train_metrics = {
+                            "loss": metrics.loss,
+                            "learning_rate": metrics.learning_rate,
+                            "gradient_norm": grad_norm,
+                            **metrics.stats,
+                        }
+                        if metrics.entropy is not None:
+                            train_metrics["entropy"] = metrics.entropy
+                        self._log_metrics(train_metrics, prefix="train")
 
-            logger.info("sync policy and rollout model weights")
-            checkpoint = ray.get(self.model_worker.get_weights.remote(self.global_step))
-            ray.get(self.rollout_worker.update_weights.remote(checkpoint))
+            logger.info("sync policy and rollout model weights...")
+            with self.profiler.timer("weight_sync"):
+                checkpoint_ref = self.model_worker.get_weights.remote(self.global_step)
+                ray.get(self.rollout_worker.update_weights.remote(checkpoint_ref))
+            
+            self.profiler.log_stats()
 
             if self.eval_dataset and (rl_step + 1) % wandb_config.eval_interval == 0:
                 logger.info(f"starting evaluation at global step {self.global_step}...")

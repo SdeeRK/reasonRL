@@ -1,4 +1,6 @@
 import ray
+import torch
+
 from vllm import LLM, SamplingParams
 
 from ..core.config import GenerationConfig, ModelConfig
@@ -86,6 +88,19 @@ class RolloutWorker:
         return RolloutBatch(groups=groups)
 
     def update_weights(self, checkpoint: ModelCheckpoint) -> None:
-        state_dict_cpu = checkpoint.state_dict
+        state_dict_numpy = checkpoint.state_dict
         engine = self.engine.llm_engine.model_executor.driver_worker.model_runner.model
-        engine.load_weights(state_dict_cpu.items())
+        
+        # Convert numpy arrays back to torch tensors
+        state_dict_torch = {}
+        for k, v in state_dict_numpy.items():
+            t = torch.from_numpy(v.copy())
+
+            # Reconstruct bfloat16 from int16 view if necessary
+            # Note: We blindly assume int16 weights are meant to be bfloat16 
+            # because typical weights are not int16.
+            if t.dtype == torch.int16:
+                t = t.view(torch.bfloat16)
+            state_dict_torch[k] = t
+
+        engine.load_weights(state_dict_torch.items())

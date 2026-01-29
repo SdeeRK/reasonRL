@@ -6,7 +6,7 @@ from loguru import logger
 def setup_logger():
     """Configure loguru logger with a structured format."""
     logger.remove()
-    log_format = "<cyan>{module}</cyan>:<cyan>{function}</cyan> - <level>{level: <8}</level> | <level>{message}</level>"
+    log_format = "<cyan>{module}</cyan>:<cyan>{function}</cyan> | <level>{level: <8}</level> | <level>{message}</level>"
     logger.add(sys.stderr, format=log_format, level="INFO", colorize=True)
 
 

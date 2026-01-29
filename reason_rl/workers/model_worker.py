@@ -273,11 +273,23 @@ class ModelWorker:
                     continue
 
                 new_key = k.replace(".base_layer", "")
-                state_dict[new_key] = v.cpu()
+                v = v.detach()
+                if v.dtype == torch.bfloat16:
+                    state_dict[new_key] = v.view(torch.int16).cpu().numpy()
+                else:
+                    state_dict[new_key] = v.cpu().numpy()
 
             self.model.unmerge_adapter()
         else:
-            state_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            # Convert to numpy for zero-copy transmission via Ray Plasma Store
+            # Trick: Numpy doesn't support bfloat16. We view it as int16 to preserve bits literally.
+            state_dict = {}
+            for k, v in self.model.state_dict().items():
+                v = v.detach()
+                if v.dtype == torch.bfloat16:
+                    state_dict[k] = v.view(torch.int16).cpu().numpy()
+                else:
+                    state_dict[k] = v.cpu().numpy()
 
         return ModelCheckpoint(global_step=global_step, state_dict=state_dict)
 
